@@ -1,0 +1,39 @@
+config = {
+        # diffusion Architecture
+        'dim': 128,
+        'dim_mults': (1, 2, 4, 8),
+        'channels': 3,
+        'attn_heads': 8,
+        'attn_dim_head': 32,
+        
+        # VAE Settings
+        'vae_latent_dim': 32,
+        'vae_base_dim': 128,
+        
+        # Video Settings
+        'image_size': 64,
+        'num_frames': 10,
+        
+        # Diffusion Settings
+        'timesteps': 1000,
+        'loss_type': 'l1',
+        'latent_scale': 1.0,
+        
+        # Training Settings
+        'train_batch_size': 4,
+        'train_lr': 1e-4,
+        'train_num_steps': 400000,
+        'gradient_accumulate_every': 2,
+        'ema_decay': 0.995,
+        'amp': True,
+        'max_grad_norm': 1.0,
+        
+        # Checkpointing
+        'save_and_sample_every': 5000,
+        'num_sample_rows': 2,
+        'results_folder': './results',
+        'data_folder': './video_diffusion_pytorch/data',
+        
+        # Resume
+        'resume_from': 36,  # Set to milestone number to resume
+    }

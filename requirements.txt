@@ -1,7 +1,0 @@
-torch>=2.0.0
-torchvision
-einops>=0.8.0
-einops-exts>=0.0.4
-rotary-embedding-torch>=0.6.0
-tqdm
-Pillow

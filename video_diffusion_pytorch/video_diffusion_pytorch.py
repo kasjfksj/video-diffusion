@@ -234,11 +234,6 @@ class VAE(nn.Module):
         self.latent_scale.copy_(latent_std)
         
         self.train()
-
-
-
-
-
 # ========== Previous Frame Conditioning ==========
 
 class FrameConditioningEncoder(nn.Module):
@@ -887,7 +882,8 @@ class GaussianDiffusion(nn.Module):
         loss_type='l1',
         use_dynamic_thres=False,
         dynamic_thres_percentile=0.9,
-        latent_scale=1.0  # FIX: Add latent scaling
+        latent_scale=1.0,
+        frame_cond_encoder=None  # ADD THIS
     ):
         super().__init__()
         self.channels = channels
@@ -895,6 +891,7 @@ class GaussianDiffusion(nn.Module):
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
         self.vae = vae
+        self.frame_cond_encoder = frame_cond_encoder  # ADD THIS
         self.latent_scale = latent_scale
         
         # FIX: Freeze VAE during diffusion training
@@ -974,9 +971,32 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, clip_denoised=True):
+    def p_sample(self, x, t, frame_cond_features=None, clip_denoised=True):
         b, *_, device = *x.shape, x.device
-        model_mean, _, model_log_variance = self.p_mean_variance(x=x, t=t, clip_denoised=clip_denoised)
+        
+        # Predict noise
+        predicted_noise = self.denoise_fn(
+            x, 
+            t, 
+            frame_cond_features=frame_cond_features,
+            null_frame_cond_prob=0.  # No dropout during sampling
+        )
+        
+        x_recon = self.predict_start_from_noise(x, t=t, noise=predicted_noise)
+
+        if clip_denoised:
+            s = 1.
+            if self.use_dynamic_thres:
+                s = torch.quantile(
+                    rearrange(x_recon, 'b ... -> b (...)').abs(),
+                    self.dynamic_thres_percentile,
+                    dim=-1
+                )
+                s.clamp_(min=1.)
+                s = s.view(-1, *((1,) * (x_recon.ndim - 1)))
+            x_recon = x_recon.clamp(-s, s) / s
+
+        model_mean, _, model_log_variance = self.q_posterior(x_start=x_recon, x_t=x, t=t)
         noise = torch.randn_like(x)
         nonzero_mask = (1 - (t == 0).float()).reshape(b, *((1,) * (len(x.shape) - 1)))
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
@@ -994,28 +1014,75 @@ class GaussianDiffusion(nn.Module):
         return img
 
     @torch.inference_mode()
-    def sample(self, batch_size=16):
+    def sample(self, batch_size=16, prev_frames=None, frame_cond_scale=1.0):
         """
-        Generate video frames unconditionally
-        Returns frames in pixel space [0, 1]
+        Generate video frames with optional frame conditioning
+        Args:
+            batch_size: Number of samples
+            prev_frames: Previous frames (B, C, F_prev, H, W) in [0, 1]
+            frame_cond_scale: Guidance scale for frame conditioning
+        Returns:
+            samples: Generated frames in pixel space [0, 1]
         """
         device = next(self.denoise_fn.parameters()).device
         
         # Get latent space dimensions
-        latent_size = self.image_size // 8  # Assuming 8x downsampling in VAE
+        latent_size = self.image_size // 8
         latent_channels = self.vae.latent_dim
         num_frames = self.num_frames
         
-        # Sample in latent space
-        latents = self.p_sample_loop(
-            (batch_size, latent_channels, num_frames, latent_size, latent_size)
-        )
+        # Encode previous frames if provided
+        frame_cond_features = None
+        if exists(prev_frames) and exists(self.frame_cond_encoder):
+            self.vae.eval()
+            with torch.no_grad():
+                prev_normalized = prev_frames * 2.0 - 1.0
+                prev_normalized = prev_normalized.clamp(-1, 1)
+                prev_latents, _ = self.vae.encode(prev_normalized)
+                prev_latents = prev_latents * self.latent_scale
+            
+            frame_cond_features = self.frame_cond_encoder(prev_latents)
+        
+        # Start with random noise
+        img = torch.randn((batch_size, latent_channels, num_frames, latent_size, latent_size), 
+                        device=device)
+        
+        # Denoise with classifier-free guidance if frame conditioning is used
+        for i in tqdm(reversed(range(0, self.num_timesteps)), 
+                    desc='sampling loop time step', total=self.num_timesteps):
+            t = torch.full((batch_size,), i, device=device, dtype=torch.long)
+            
+            if exists(frame_cond_features) and frame_cond_scale != 1.0:
+                # Conditional prediction
+                noise_cond = self.denoise_fn(
+                    img, t, 
+                    frame_cond_features=frame_cond_features,
+                    null_frame_cond_prob=0.
+                )
+                
+                # Unconditional prediction
+                noise_uncond = self.denoise_fn(
+                    img, t,
+                    frame_cond_features=frame_cond_features,
+                    null_frame_cond_prob=1.0  # Drop conditioning
+                )
+                
+                # Classifier-free guidance
+                noise_pred = noise_uncond + frame_cond_scale * (noise_cond - noise_uncond)
+                
+                # Manual denoising step
+                x_recon = self.predict_start_from_noise(img, t, noise_pred)
+                x_recon = x_recon.clamp(-1, 1)
+                model_mean, _, model_log_variance = self.q_posterior(x_start=x_recon, x_t=img, t=t)
+                noise = torch.randn_like(img) if i > 0 else torch.zeros_like(img)
+                img = model_mean + (0.5 * model_log_variance).exp() * noise
+            else:
+                img = self.p_sample(img, t, frame_cond_features=frame_cond_features)
         
         # Decode latents to pixels
         self.vae.eval()
         with torch.no_grad():
-            samples = self.vae.decode(latents)
-            # Clamp and normalize to [0, 1]
+            samples = self.vae.decode(img / self.latent_scale)
             samples = samples.clamp(-1, 1)
             samples = (samples + 1) / 2
         
@@ -1029,13 +1096,18 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise=None):
+    def p_losses(self, x_start, t, prev_frames=None, noise=None, null_frame_cond_prob=0., 
+                prob_focus_present=0., focus_present_mask=None):  # ADD THESE
         """
-        Training loss - FIX: Predict noise consistently
+        Training loss with frame conditioning
         Args:
             x_start: Current frames in pixel space (B, C, F, H, W) in [0, 1]
             t: Timesteps (B,)
+            prev_frames: Previous frames (B, C, F_prev, H, W) in [0, 1]
             noise: Optional noise (if None, sampled randomly)
+            null_frame_cond_prob: Probability of dropping frame conditioning
+            prob_focus_present: Probability of focusing on present frame (unused for now)
+            focus_present_mask: Mask for focusing on present (unused for now)
         """
         b, c, f, h, w, device = *x_start.shape, x_start.device
         
@@ -1043,29 +1115,44 @@ class GaussianDiffusion(nn.Module):
         x_start_normalized = x_start * 2.0 - 1.0
         x_start_normalized = x_start_normalized.clamp(-1, 1)
         
-        # FIX: Encode with VAE in eval mode and no gradients
+        # Encode with VAE
         self.vae.eval()
         with torch.no_grad():
             x_start_latent, _ = self.vae.encode(x_start_normalized)
         
-        # FIX: Scale latents appropriately - this is critical!
-        # If latents are too small, the signal disappears in noise
+        # Scale latents
         x_start_latent = x_start_latent * self.latent_scale
-        
-        # FIX: Don't clamp too aggressively
         x_start_latent = x_start_latent.clamp(-10, 10)
+        
+        # Encode previous frames if provided
+        frame_cond_features = None
+        if exists(prev_frames) and exists(self.frame_cond_encoder):
+            with torch.no_grad():
+                prev_normalized = prev_frames * 2.0 - 1.0
+                prev_normalized = prev_normalized.clamp(-1, 1)
+                prev_latents, _ = self.vae.encode(prev_normalized)
+                prev_latents = prev_latents * self.latent_scale
+            
+            # Extract conditioning features
+            frame_cond_features = self.frame_cond_encoder(prev_latents)
         
         # Sample random noise
         noise = default(noise, lambda: torch.randn_like(x_start_latent))
         
-        # Add noise to latent (forward diffusion process)
+        # Add noise to latent
         x_noisy = self.q_sample(x_start=x_start_latent, t=t, noise=noise)
         
-        # FIX: Model predicts the noise that was added
-        # This is the standard diffusion training objective
-        predicted_noise = self.denoise_fn(x_noisy, t)
+        # Predict noise with frame conditioning
+        predicted_noise = self.denoise_fn(
+            x_noisy, 
+            t, 
+            frame_cond_features=frame_cond_features,
+            null_frame_cond_prob=null_frame_cond_prob,
+            prob_focus_present=prob_focus_present,  # Pass through
+            focus_present_mask=focus_present_mask   # Pass through
+        )
         
-        # Loss: how well can we predict the noise?
+        # Loss
         if self.loss_type == 'l1':
             loss = F.l1_loss(noise, predicted_noise)
         elif self.loss_type == 'l2':
@@ -1074,22 +1161,25 @@ class GaussianDiffusion(nn.Module):
             raise NotImplementedError()
 
         return loss
-
-    def forward(self, x, *args, **kwargs):
+    def forward(self, x, prev_frames=None, null_frame_cond_prob=0., *args, **kwargs):
         """
         Forward pass for training
         Args:
             x: Video frames (B, C, F, H, W) in pixel space [0, 1]
+            prev_frames: Previous frames (B, C, F_prev, H, W) in [0, 1]
+            null_frame_cond_prob: Probability of dropping frame conditioning
         """
         b, device, img_size = x.shape[0], x.device, self.image_size
         
         # Clamp input to [0, 1] range
         x = x.clamp(0, 1)
         
-        # Sample random timesteps for each batch element
+        # Sample random timesteps
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
         
-        return self.p_losses(x, t, *args, **kwargs)
+        return self.p_losses(x, t, prev_frames=prev_frames, 
+                            null_frame_cond_prob=null_frame_cond_prob, 
+                            *args, **kwargs)
 
 
 # trainer class
@@ -1223,7 +1313,7 @@ class Trainer(object):
         update_ema_every = 10,
         save_and_sample_every = 1000,
         results_folder = './results',
-        num_sample_rows = 4,
+        num_sample_rows = 2,
         max_grad_norm = None,
         null_frame_cond_prob = 0.1,  # NEW: probability of dropping frame conditioning
         frame_cond_scale = 1.5  # NEW: frame conditioning guidance scale
@@ -1295,7 +1385,7 @@ class Trainer(object):
 
     def load(self, milestone, **kwargs):
         if milestone == -1:
-            all_milestones = [int(p.stem.split('-')[-1]) for p in Path(self.results_folder).glob('**/*.pt')]
+            all_milestones = [int(p.stem.split('-')[-1]) for p in Path(self.results_folder).glob('*.pt')]
             assert len(all_milestones) > 0, 'need to have at least one milestone to load'
             milestone = max(all_milestones)
 
